@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<meta name="theme-color" content="#000080">
+<meta name="mobile-web-app-capable" content="yes">
+<title>36 Lights</title>
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body { margin: 0; background: #000; color: #fff; font-family: Arial, Helvetica, sans-serif; user-select: none; }
+  #bar { padding: 14px 10px; text-align: center; font-size: 20px; font-weight: bold; background: #c00; }
+  #bar.ok { background: #000080; }
+  #bar.warn { background: #b36b00; }
+  #list { padding: 8px; display: grid; gap: 8px; }
+  .btn { display: flex; justify-content: space-between; align-items: center; width: 100%;
+         min-height: 58px; padding: 0 16px; border: none; border-radius: 8px;
+         font-size: 20px; font-weight: bold; color: #000; background: #555; }
+  .btn.on  { background: #00e000; }
+  .btn.off { background: #e00000; }
+  .btn.wait { background: #ffff00; }
+  .btn:disabled { background: #555; color: #222; }
+  #alloff { background: #fff; margin-top: 6px; justify-content: center; }
+  #alloff.armed { background: #ffff00; }
+  #connect { width: calc(100% - 16px); margin: 8px; min-height: 58px; font-size: 20px; font-weight: bold;
+             border: none; border-radius: 8px; background: #000080; color: #fff; }
+  #msg { padding: 4px 10px 14px; font-size: 14px; color: #aaa; text-align: center; min-height: 20px; }
+</style>
+</head>
+<body>
+<div id="bar">NOT CONNECTED</div>
+<button id="connect">Connect to Truck36 Lights</button>
+<div id="list"></div>
+<div id="msg"></div>
+<script>
+// ===== #36 phone control page =====
+// Talks to the relay board over Bluetooth (Nordic UART service) in Chrome on Android.
+// Board sends "M:hh L:n" (relay mask hex, touch screen link up 1/0). Page sends "1".."8", "ALL OFF", "S".
+const NAMES = ["Marker Lights", "Left ditch light", "Right ditch light", "Rear lights", "Red lights",
+               "Interior lights", "Outside power", "SP1"];
+const SVC = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+const RX  = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";   // phone -> board
+const TX  = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";   // board -> phone
+const STALE_MS = 3000;   // no state line this long -> show "no update"
+
+let device = null, rxChar = null, mask = 0, linkUp = false, connected = false;
+let lastState = 0, pending = -1, pendingTimer = null, rxBuf = "", wantConnected = false;
+const bar = document.getElementById("bar"), list = document.getElementById("list");
+const msg = document.getElementById("msg"), connectBtn = document.getElementById("connect");
+
+const btns = NAMES.map((name, i) => {
+  const b = document.createElement("button");
+  b.className = "btn";
+  b.innerHTML = `<span>${name}</span><span class="st">--</span>`;
+  b.onclick = () => toggle(i);
+  list.appendChild(b);
+  return b;
+});
+const allOff = document.createElement("button");
+allOff.id = "alloff"; allOff.className = "btn"; allOff.textContent = "ALL OFF";
+let armTimer = null;
+allOff.onclick = () => {                         // two taps within 3 s so a pocket bump can't kill everything
+  if (!allOff.classList.contains("armed")) {
+    allOff.classList.add("armed"); allOff.textContent = "TAP AGAIN FOR ALL OFF";
+    armTimer = setTimeout(disarm, 3000);
+  } else { disarm(); send("ALL OFF"); }
+};
+function disarm() { clearTimeout(armTimer); allOff.classList.remove("armed"); allOff.textContent = "ALL OFF"; }
+list.appendChild(allOff);
+
+function draw() {
+  const fresh = connected && (Date.now() - lastState < STALE_MS);
+  const usable = fresh && linkUp;
+  if (!connected) { bar.className = ""; bar.textContent = "NOT CONNECTED"; }
+  else if (!fresh) { bar.className = "warn"; bar.textContent = "NO UPDATE FROM TRUCK"; }
+  else if (!linkUp) { bar.className = ""; bar.textContent = "TOUCH SCREEN LINK DOWN - LIGHTS OFF"; }
+  else { bar.className = "ok"; bar.textContent = "#36 LIGHTS"; }
+  connectBtn.style.display = connected ? "none" : "block";
+  btns.forEach((b, i) => {
+    const on = (mask >> i) & 1;
+    b.disabled = !usable;
+    b.classList.toggle("wait", i === pending && usable);
+    b.classList.toggle("on", usable && i !== pending && on);
+    b.classList.toggle("off", usable && i !== pending && !on);
+    b.querySelector(".st").textContent = !usable ? "--" : (i === pending ? "..." : (on ? "ON" : "OFF"));
+  });
+  allOff.disabled = !usable;
+}
+setInterval(draw, 500);
+
+async function send(text) {
+  if (!rxChar) return;
+  try { await rxChar.writeValue(new TextEncoder().encode(text)); }
+  catch (e) { msg.textContent = "Send failed: " + e.message; }
+}
+
+function toggle(i) {
+  if (pending >= 0) return;
+  pending = i; draw();
+  clearTimeout(pendingTimer);
+  pendingTimer = setTimeout(() => { pending = -1; msg.textContent = "No answer from truck"; draw(); }, 2000);
+  send(String(i + 1));
+}
+
+function onData(ev) {
+  rxBuf += new TextDecoder().decode(ev.target.value);
+  let n;
+  while ((n = rxBuf.indexOf("\n")) >= 0) {
+    const line = rxBuf.slice(0, n).trim(); rxBuf = rxBuf.slice(n + 1);
+    const m = line.match(/^M:([0-9A-Fa-f]{2}) L:([01])$/);
+    if (m) {
+      mask = parseInt(m[1], 16); linkUp = m[2] === "1"; lastState = Date.now();
+      if (pending >= 0) { pending = -1; clearTimeout(pendingTimer); msg.textContent = ""; }
+      draw();
+    } else if (line.startsWith("TOUCH SCREEN") || line.startsWith("?")) {
+      msg.textContent = line;
+    }
+  }
+  if (rxBuf.length > 500) rxBuf = "";
+}
+
+async function connectGatt() {
+  const server = await device.gatt.connect();
+  const svc = await server.getPrimaryService(SVC);
+  rxChar = await svc.getCharacteristic(RX);
+  const tx = await svc.getCharacteristic(TX);
+  tx.addEventListener("characteristicvaluechanged", onData);
+  await tx.startNotifications();               // first time: Android asks for the PIN here
+  connected = true; msg.textContent = ""; rxBuf = "";
+  await send("S");
+  draw();
+}
+
+async function reconnect() {
+  for (let i = 0; wantConnected && !connected && i < 20; i++) {
+    msg.textContent = "Reconnecting...";
+    try { await connectGatt(); return; } catch (e) { await new Promise(r => setTimeout(r, 2000)); }
+  }
+  if (!connected) msg.textContent = "Lost connection - tap Connect";
+}
+
+connectBtn.onclick = async () => {
+  if (!navigator.bluetooth) { msg.textContent = "Bluetooth not available - open this page in Chrome on Android"; return; }
+  try {
+    device = await navigator.bluetooth.requestDevice({ filters: [{ name: "Truck36 Lights" }], optionalServices: [SVC] });
+    device.addEventListener("gattserverdisconnected", () => { connected = false; rxChar = null; draw(); reconnect(); });
+    wantConnected = true;
+    msg.textContent = "Connecting...";
+    await connectGatt();
+  } catch (e) { msg.textContent = "Connect failed: " + e.message; }
+};
+draw();
+</script>
+</body>
+</html>
